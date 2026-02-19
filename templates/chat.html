@@ -1,0 +1,181 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Chat</title>
+  <style>
+    body { margin:0; font-family: system-ui; background:#fff; }
+    .wrap { height:100vh; display:flex; flex-direction:column; }
+    .msgs { flex:1; overflow:auto; padding:12px; background:#fff; }
+    .bubble { margin:10px 0; max-width:85%; padding:10px 12px; border-radius:14px; background:#f3f4f6; white-space:pre-wrap; }
+    .me { margin-left:auto; background:#111; color:#fff; }
+    .sys { background:#fff7ed; border:1px solid #fed7aa; color:#7c2d12; }
+    .agent { background:#eef2ff; border:1px solid #c7d2fe; color:#1e3a8a; }
+    .row { display:flex; gap:8px; padding:10px; border-top:1px solid #eee; background:#fff; }
+    input { flex:1; padding:10px 12px; border:1px solid #ddd; border-radius:12px; outline:none; }
+    button { padding:10px 12px; border:0; border-radius:12px; background:#111; color:#fff; cursor:pointer; }
+    .hint { padding:8px 12px; font-size:12px; color:#666; border-top:1px dashed #eee; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div id="msgs" class="msgs"></div>
+  <div class="row">
+    <input id="inp" placeholder="Écris un message..." />
+    <button id="send">Envoyer</button>
+  </div>
+  <div class="hint" id="hint"></div>
+</div>
+
+<script>
+  const msgs = document.getElementById("msgs");
+  const inp  = document.getElementById("inp");
+  const send = document.getElementById("send");
+  const hint = document.getElementById("hint");
+
+  const params = new URLSearchParams(location.search);
+  const botId  = params.get("botId") || "default";
+  const title  = params.get("title") || "Assistant";
+
+  // session persistante par bot (même si tu fermes/réouvres le widget)
+  const storageKey = "chat_session_id__" + botId;
+  const sessionId  = localStorage.getItem(storageKey) || crypto.randomUUID();
+  localStorage.setItem(storageKey, sessionId);
+
+  // anti-doublon
+  const seen = new Set();
+  const keyOf = (m) => `${m.ts}|${m.event || "message"}|${m.role}|${m.content}`;
+
+  let lastTs = 0;
+  let es = null;
+  let pollTimer = null;
+
+  function setHint(extra){
+    hint.textContent = `${title} · botId=${botId} · ${extra}`;
+  }
+
+  function add(text, who="assistant"){
+    const d = document.createElement("div");
+    d.className = "bubble";
+    if (who === "user")   d.className += " me";
+    if (who === "system") d.className += " sys";
+    if (who === "agent")  d.className += " agent";
+    d.textContent = text;
+    msgs.appendChild(d);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function applyEvent(m, allowUser=false){
+    const k = keyOf(m);
+    if (seen.has(k)) return;
+    seen.add(k);
+
+    if (typeof m.ts === "number") lastTs = Math.max(lastTs, m.ts);
+
+    if (m.event === "closed") {
+      add("🕒 Conversation fermée.", "system");
+      stopSSE();
+      // on laisse le polling tourner encore 1 cycle max (inutile après close)
+      return;
+    }
+
+    if (!allowUser && m.role === "user") return;
+
+    if (m.role === "assistant") add(m.content, "assistant");
+    else if (m.role === "agent") add("Agent: " + m.content, "agent");
+    else if (m.role === "system") add(m.content, "system");
+    else if (m.role === "user") add(m.content, "user");
+  }
+
+  function stopSSE(){
+    if (es) { try { es.close(); } catch {} es = null; }
+  }
+
+  async function loadHistory(){
+    setHint("chargement historique…");
+    const r = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}&limit=200`, { cache: "no-store" });
+    if (!r.ok) { setHint("erreur historique"); return; }
+
+    const items = await r.json();
+    msgs.innerHTML = "";
+    seen.clear();
+    lastTs = 0;
+
+    for (const m of items) applyEvent(m, true);
+
+    // si vide => greeting
+    if (!items.length) add(`Bonjour ! Je suis ${title}.`, "assistant");
+
+    setHint("prêt");
+  }
+
+  async function pollOnce(){
+    const url = `/api/poll?session_id=${encodeURIComponent(sessionId)}&after_ts=${encodeURIComponent(lastTs)}&limit=50`;
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) return;
+    const items = await r.json();
+    for (const m of items) applyEvent(m, false);
+  }
+
+  function startHybridPolling(){
+    if (pollTimer) return;
+    pollTimer = setInterval(pollOnce, 1500);
+  }
+
+  function startSSE(){
+    stopSSE();
+    setHint("live (SSE + polling)");
+
+    es = new EventSource(`/api/events?session_id=${encodeURIComponent(sessionId)}`);
+
+    es.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        applyEvent(m, false);
+      } catch {}
+    };
+
+    // Même si SSE freeze sans error, notre polling récupère quand même.
+    es.onerror = () => {
+      // On ne dépend pas de SSE, mais on laisse le polling faire le job.
+      // Optionnel: stopSSE();  (tu peux le faire si tu veux éviter les reconnects)
+    };
+  }
+
+  async function sendMsg(){
+    const text = inp.value.trim();
+    if(!text) return;
+    inp.value = "";
+    add(text, "user");
+
+    const r = await fetch("/api/chat", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ bot_id: botId, session_id: sessionId, message: text }),
+      cache: "no-store"
+    });
+
+    if(!r.ok){
+      add(r.status === 429 ? "Trop de requêtes (rate-limit)." : "Erreur serveur.", "system");
+      return;
+    }
+
+    await r.json();
+
+    // Force un poll rapide après envoi (utile si SSE est figé)
+    setTimeout(pollOnce, 300);
+    setTimeout(pollOnce, 1200);
+  }
+
+  send.onclick = sendMsg;
+  inp.addEventListener("keydown", e => { if(e.key==="Enter") sendMsg(); });
+
+  (async () => {
+    await loadHistory();
+    startHybridPolling();  // <- important: toujours actif
+    startSSE();            // <- bonus si ça marche
+  })();
+</script>
+</body>
+</html>
