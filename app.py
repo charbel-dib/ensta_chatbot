@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,11 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel, Field
 
+import smtplib
+from email.message import EmailMessage
+
+MSG_GREETING = "Bonjour ! Je suis votre assistant intelligent de l’ENSTA. Comment puis-je vous aider ?"
+
 
 # ============================================================
 # APP PATHS
@@ -37,35 +43,38 @@ BASE_DIR = Path(__file__).resolve().parent
 # FASTAPI INIT
 # ============================================================
 app = FastAPI()
-
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 @app.get("/")
 async def root():
-    # accès direct au chat (tu peux changer title/botId si tu veux)
-    return RedirectResponse(url="/chat?botId=default&title=Assistant")
+    # titre par défaut affiché côté UI
+    return RedirectResponse(url="/chat?botId=default&title=Assistant%20(phase%20de%20test)")
+
 
 
 # ============================================================
-# RAG CONFIG (DEPLOY-FRIENDLY via env vars)
+# RAG CONFIG (deploy-friendly via env vars)
 # ============================================================
-# Important: plus de chemin Windows "C:\..."
 DATASET_DIR = Path(os.getenv("ENSTA_DATASET", str(BASE_DIR / "ENSTA_DATASET"))).resolve()
 INDEX_PATH = Path(os.getenv("FAISS_INDEX_PATH", str(DATASET_DIR / "04_index" / "ensta.faiss"))).resolve()
-META_PATH  = Path(os.getenv("META_JSONL_PATH", str(DATASET_DIR / "04_index" / "ensta_meta.jsonl"))).resolve()
+META_PATH = Path(os.getenv("META_JSONL_PATH", str(DATASET_DIR / "04_index" / "ensta_meta.jsonl"))).resolve()
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 EMB_MODEL = os.getenv("EMB_MODEL", "intfloat/multilingual-e5-base")
 QUERY_PREFIX = os.getenv("QUERY_PREFIX", "query: ")
 
-TOP_K = int(os.getenv("TOP_K", "6"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.1"))
+TOP_K = int(os.getenv("TOP_K", "8"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.08"))
 
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "8"))
 MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "6000"))
+
+# limite de concurrence pour garder une latence stable
+OPENAI_CONCURRENCY = int(os.getenv("OPENAI_CONCURRENCY", "6"))
+RAG_SEM = asyncio.Semaphore(OPENAI_CONCURRENCY)
 
 SYSTEM_RULES = """You are an ENSTA campus assistant. You can mention that when asked,
 You MUST answer ONLY using the provided SOURCES.
@@ -82,6 +91,75 @@ Rules:
 - Use citations like [S1], [S2] inline in the answer.
 - Output ONLY the Answer text (no 'Sources' section).
 """
+
+# Messages UX
+MSG_GIBBERISH = "Je n'ai pas compris ça."
+MSG_ASK_EMAIL = (
+    "Je n’ai pas la réponse à cette question. "
+    "Si vous souhaitez la transmettre au service compétent, veuillez saisir votre adresse e-mail pour recevoir une réponse. "
+    "Sinon, posez une autre question pour continuer la conversation."
+)
+MSG_EMAIL_SENT = "Merci. Votre demande a été transmise. Si nécessaire, l’équipe pourra vous recontacter à cette adresse."
+MSG_EMAIL_BAD = "Je ne reconnais pas cette adresse e-mail. Pouvez-vous la ressaisir (ex. prenom.nom@domaine.fr) ?"
+MSG_EMAIL_NOT_CONFIGURED = (
+    "Merci. L’envoi d’e-mail n’est pas encore configuré sur ce serveur. "
+    "Veuillez réessayer plus tard ou contacter directement le support."
+)
+
+MSG_WHOAMI = (
+    "Je suis un assistant du campus ENSTA. "
+    "Je peux répondre aux questions liées au site et aux documents ENSTA en m’appuyant sur des sources internes. "
+    "Si je ne trouve pas l’information, je vous proposerai de transmettre votre demande par e-mail."
+)
+
+# ============================================================
+# EMAIL / SMTP CONFIG (env vars)
+# ============================================================
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
+SUPPORT_TO = os.getenv("SUPPORT_TO", "charbel.dib@ensta.fr").strip()
+SUPPORT_SUBJECT_PREFIX = os.getenv("SUPPORT_SUBJECT_PREFIX", "[ENSTA Chatbot - Ticket]").strip()
+
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+
+
+def email_enabled() -> bool:
+    return bool(SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM and SUPPORT_TO)
+
+
+def extract_email(text: str) -> Optional[str]:
+    m = EMAIL_RE.search(text or "")
+    return m.group(0) if m else None
+
+
+def send_support_email_sync(
+    user_email: str,
+    session_id: str,
+    unanswered_question: str,
+    transcript: str,
+) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = f"{SUPPORT_SUBJECT_PREFIX} session={session_id}"
+    msg["From"] = SMTP_FROM
+    msg["To"] = SUPPORT_TO
+    msg["Reply-To"] = user_email
+
+    body = (
+        f"Session ID: {session_id}\n"
+        f"User email: {user_email}\n\n"
+        f"Question sans réponse:\n{unanswered_question}\n\n"
+        f"Transcript (récent):\n{transcript}\n"
+    )
+    msg.set_content(body)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+        s.ehlo()
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASS)
+        s.send_message(msg)
 
 
 # ============================================================
@@ -165,7 +243,72 @@ def call_openai(client: OpenAI, history: List[Dict[str, str]], user_q: str, sour
 
 
 # ============================================================
-# RAG OBJECTS (lazy loaded)
+# Irrelevant / gibberish detection + meta/smalltalk
+# ============================================================
+VOWELS = set("aeiouyàâäéèêëîïôöùûüÿœ")
+
+SMALLTALK_HINTS = [
+    "qui es tu", "qui es-tu", "t'es qui", "tu es qui",
+    "que fais tu", "que fais-tu", "tu fais quoi", "c'est quoi ton role",
+    "comment tu marches", "comment ça marche", "comment ca marche",
+    "a quoi tu sers", "à quoi tu sers", "que peux tu faire", "que peux-tu faire",
+    "tes limites", "tu peux répondre à quoi", "tu peux faire quoi",
+]
+
+def normalize_text(t: str) -> str:
+    t = (t or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def is_smalltalk_or_meta(text: str) -> bool:
+    t = normalize_text(text)
+    # on autorise aussi les variants avec ponctuation
+    t2 = re.sub(r"[^\w\sàâäéèêëîïôöùûüÿœ-]", "", t)
+    for s in SMALLTALK_HINTS:
+        if s in t or s in t2:
+            return True
+    # questions très courtes “meta”
+    if t in {"qui es-tu", "qui es tu", "qui es tu ?", "tu es qui", "tu es qui ?"}:
+        return True
+    return False
+
+def looks_like_gibberish(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if extract_email(t):
+        return False
+    # smalltalk/meta ne doit PAS être pris pour du bruit
+    if is_smalltalk_or_meta(t):
+        return False
+
+    compact = "".join(ch for ch in t if not ch.isspace())
+    if len(compact) <= 1:
+        return True
+
+    letters = [c for c in compact if c.isalpha()]
+    if not letters:
+        return len(compact) >= 4
+
+    alpha_ratio = len(letters) / max(1, len(compact))
+    if alpha_ratio < 0.5 and len(compact) >= 7:
+        return True
+
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", t)
+    if len(words) == 1:
+        w = words[0]
+        if len(w) >= 8:
+            v = sum((ch.lower() in VOWELS) for ch in w)
+            if v / len(w) < 0.2:
+                return True
+            if re.search(r"(.)\1\1\1", w):
+                return True
+
+    return False
+
+
+# ============================================================
+# RAG OBJECTS (loaded at startup)
 # ============================================================
 RAG_INDEX: Any = None
 RAG_METAS: Optional[List[Dict[str, Any]]] = None
@@ -218,7 +361,7 @@ async def ensure_rag_loaded() -> None:
             try:
                 _load_rag_sync()
                 RAG_READY = True
-                print("[OK] RAG loaded (lazy)")
+                print("[OK] RAG loaded")
             except Exception as e:
                 RAG_ERROR = e
                 print("[ERROR] RAG load failed:", repr(e))
@@ -233,7 +376,7 @@ async def ensure_rag_loaded() -> None:
 Mode = Literal["bot", "closed"]
 EventType = Literal["message", "closed"]
 
-TTL_SECONDS = int(os.getenv("TTL_SECONDS", "120"))  # 2 min idle -> close
+TTL_SECONDS = int(os.getenv("TTL_SECONDS", "120"))
 HISTORY_MAX = int(os.getenv("HISTORY_MAX", "400"))
 RATE_LIMIT_MIN_SECONDS = float(os.getenv("RATE_LIMIT_MIN_SECONDS", "0.25"))
 
@@ -254,8 +397,13 @@ class SessionState:
     created_at: float = field(default_factory=lambda: time.time())
     last_activity: float = field(default_factory=lambda: time.time())
     closed_at: Optional[float] = None
+
     history: List[EventMsg] = field(default_factory=list)
     subscribers: set["queue.Queue[EventMsg]"] = field(default_factory=set)
+
+    # email flow
+    awaiting_email: bool = False
+    unanswered_question: Optional[str] = None
 
 
 SESSIONS_STATE: Dict[str, SessionState] = {}
@@ -301,19 +449,53 @@ def close_session(session_id: str, reason: str) -> None:
     push(session_id, "system", f"Conversation fermée. reason={reason}", event="closed")
 
 
+def build_transcript(st: SessionState, limit: int = 30) -> str:
+    items = st.history[-limit:]
+    lines = []
+    for ev in items:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev.ts))
+        lines.append(f"{ts} [{ev.role}] {ev.content}")
+    return "\n".join(lines)
+
+
+def recent_context_for_retrieval(st: Optional[SessionState], max_chars: int = 700, max_events: int = 8) -> str:
+    """
+    Contexte compact uniquement pour améliorer le retrieval sur les follow-ups.
+    """
+    if not st or not st.history:
+        return ""
+    # on prend les derniers tours (user/assistant/system exclus) en remontant
+    items = []
+    for ev in reversed(st.history[:-1]):  # exclure user courant
+        if ev.event != "message":
+            continue
+        if ev.role not in ("user", "assistant"):
+            continue
+        items.append(f"{ev.role}: {ev.content.strip()}")
+        if len(items) >= max_events:
+            break
+    items.reverse()
+    ctx = "\n".join(items).strip()
+    if len(ctx) > max_chars:
+        ctx = ctx[-max_chars:]
+    return ctx
+
+
+# ============================================================
+# STARTUP: preload RAG + TTL GC
+# ============================================================
 @app.on_event("startup")
-async def start_ttl_gc():
+async def startup():
+    await ensure_rag_loaded()
+
     async def gc_loop():
         while True:
             now = time.time()
             for sid, st in list(SESSIONS_STATE.items()):
                 if st.mode != "closed" and (now - st.last_activity > TTL_SECONDS):
                     close_session(sid, "ttl")
-
-                # purge RAM après fermeture
                 if st.mode == "closed" and st.closed_at and (now - st.closed_at > 30):
                     SESSIONS_STATE.pop(sid, None)
-
             await anyio.sleep(15)
 
     asyncio.create_task(gc_loop())
@@ -349,7 +531,6 @@ async def api_events(session_id: str):
 
     async def gen():
         try:
-            # replay
             for ev in st.history[-200:]:
                 data = json.dumps(
                     {"event": ev.event, "role": ev.role, "content": ev.content, "ts": ev.ts},
@@ -357,7 +538,6 @@ async def api_events(session_id: str):
                 )
                 yield f"data: {data}\n\n"
 
-            # live
             while True:
                 try:
                     ev = await anyio.to_thread.run_sync(lambda: subq.get(timeout=10))
@@ -383,43 +563,77 @@ async def api_events(session_id: str):
 
 
 # ============================================================
-# BOT (RAG)
+# BOT (RAG) - returns outcome
 # ============================================================
-async def run_rag(bot_id: str, session_id: str, message: str) -> str:
-    await ensure_rag_loaded()
+RagOutcome = Literal["ok", "gibberish", "no_answer"]
 
+
+async def run_rag(bot_id: str, session_id: str, message: str) -> Tuple[RagOutcome, str]:
+    # 0) smalltalk/meta -> réponse autorisée (pas d'email)
+    if is_smalltalk_or_meta(message):
+        return "ok", MSG_WHOAMI
+
+    # 1) gibberish
+    if looks_like_gibberish(message):
+        return "gibberish", MSG_GIBBERISH
+
+    # 2) greeting
     mlow = message.strip().lower()
     if mlow in {"bonjour", "salut", "hello", "coucou", "bonsoir"} or mlow.startswith("bonjour"):
-        return "Bonjour ! Je suis un assistant du campus ENSTA. Comment puis-je vous aider ?"
+        return "ok", MSG_GREETING
+
 
     st = SESSIONS_STATE.get(session_id)
+
+    # mémoire LLM (pour pronoms/follow-ups)
     hist_msgs: List[Dict[str, str]] = []
     if st and st.history:
-        for ev in st.history[:-1]:  # ignore le user courant
+        for ev in st.history[:-1]:
             if ev.event != "message":
                 continue
             if ev.role not in ("user", "assistant"):
                 continue
             hist_msgs.append({"role": ev.role, "content": ev.content})
-
     hist_msgs = prune_history(hist_msgs)
 
-    def _sync() -> str:
-        qvec = embed_query(RAG_EMB, message)
-        results = retrieve(RAG_INDEX, RAG_METAS or [], qvec)
-        sources_text, best = build_sources_block(results)
+    ctx = recent_context_for_retrieval(st)
+    expanded_query = message
+    if ctx:
+        expanded_query = f"{message}\n\nContexte récent:\n{ctx}"
+
+    def _sync() -> Tuple[RagOutcome, str]:
+        # Passe 1 : query = message
+        qvec1 = embed_query(RAG_EMB, message)
+        res1 = retrieve(RAG_INDEX, RAG_METAS or [], qvec1)
+        src1, best1 = build_sources_block(res1)
+
+        # Passe 2 (si faible) : query = message + contexte
+        best = best1
+        sources_text = src1
+        if (best1 < MIN_SCORE) and ctx:
+            qvec2 = embed_query(RAG_EMB, expanded_query)
+            res2 = retrieve(RAG_INDEX, RAG_METAS or [], qvec2)
+            src2, best2 = build_sources_block(res2)
+            if best2 > best1:
+                best = best2
+                sources_text = src2
 
         if best < MIN_SCORE or not sources_text:
-            return "Je ne peux pas vous aider avec ça."
+            return "no_answer", ""
 
         ans = call_openai(RAG_CLIENT, hist_msgs, message, sources_text).strip()
-        return ans if ans else "Je ne peux pas vous aider avec ça."
+        if not ans:
+            return "no_answer", ""
+        if ans.strip() == "Je ne peux pas vous aider avec ça.":
+            return "no_answer", ""
+        return "ok", ans
 
-    return await anyio.to_thread.run_sync(_sync)
+    async with RAG_SEM:
+        return await anyio.to_thread.run_sync(_sync)
 
 
 # ============================================================
-# USER CHAT API (BOT-ONLY)
+# USER CHAT API (bot-only + email flow)
 # ============================================================
 class ChatIn(BaseModel):
     bot_id: str = Field(default="default", max_length=64)
@@ -433,15 +647,54 @@ async def api_chat(payload: ChatIn):
         return JSONResponse(status_code=429, content={"error": "Too many requests"})
 
     st = SESSIONS_STATE.setdefault(payload.session_id, SessionState())
-
-    # si fermé et l'user revient => nouvelle session RAM
     if st.mode == "closed":
         SESSIONS_STATE[payload.session_id] = SessionState()
         st = SESSIONS_STATE[payload.session_id]
 
-    push(payload.session_id, "user", payload.message)
+    user_text = payload.message.strip()
+    push(payload.session_id, "user", user_text)
 
-    reply = await run_rag(payload.bot_id, payload.session_id, payload.message)
+    # 1) Flow e-mail : si on attend un email
+    if st.awaiting_email:
+        mail = extract_email(user_text)
+        if mail:
+            if email_enabled():
+                transcript = build_transcript(st, limit=40)
+                q = st.unanswered_question or "(question inconnue)"
+                try:
+                    await anyio.to_thread.run_sync(
+                        lambda: send_support_email_sync(mail, payload.session_id, q, transcript)
+                    )
+                    push(payload.session_id, "assistant", MSG_EMAIL_SENT)
+                except Exception as e:
+                    push(payload.session_id, "system", f"Erreur lors de l’envoi e-mail: {repr(e)}")
+                    push(payload.session_id, "assistant", MSG_EMAIL_NOT_CONFIGURED)
+            else:
+                push(payload.session_id, "assistant", MSG_EMAIL_NOT_CONFIGURED)
+
+            st.awaiting_email = False
+            st.unanswered_question = None
+            return {"ok": True}
+
+        # pas un email -> l’utilisateur continue la conversation normalement
+        st.awaiting_email = False
+        st.unanswered_question = None
+
+    # 2) RAG normal
+    outcome, reply = await run_rag(payload.bot_id, payload.session_id, user_text)
+
+    if outcome == "gibberish":
+        push(payload.session_id, "assistant", reply)
+        return {"ok": True}
+
+    if outcome == "no_answer":
+        # IMPORTANT: on ne propose l’email que pour des questions “pertinentes”
+        # Ici, le filtre smalltalk/meta est déjà traité avant -> donc OK.
+        st.awaiting_email = True
+        st.unanswered_question = user_text
+        push(payload.session_id, "assistant", MSG_ASK_EMAIL)
+        return {"ok": True}
+
     push(payload.session_id, "assistant", reply)
     return {"ok": True}
 
@@ -458,6 +711,10 @@ async def health():
         "sessions_in_ram": len(SESSIONS_STATE),
         "index_path": str(INDEX_PATH),
         "meta_path": str(META_PATH),
+        "email_enabled": email_enabled(),
+        "openai_concurrency": OPENAI_CONCURRENCY,
+        "min_score": MIN_SCORE,
+        "top_k": TOP_K,
     }
 
 
