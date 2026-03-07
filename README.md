@@ -1,5 +1,14 @@
 # ACA-ENSTA - ENSTA Campus Assistant 
+## Quick Start
 
+```bash
+python -m venv .venv
+# Windows:
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env
+python -m uvicorn app:app --host 127.0.0.1 --port 8001 --log-level info --no-access-log
+```
 This repository contains a complete **end-to-end prototype** of an ENSTA campus assistant based on **Retrieval-Augmented Generation (RAG)**:
 - an **offline pipeline** that builds a knowledge base (**web + PDFs + XLSX → FAISS index**),
 - an **online FastAPI service** that answers with **grounded citations** and a **safe refusal + escalation** workflow,
