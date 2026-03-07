@@ -1,0 +1,306 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>Assistant (phase de test)</title>
+
+  <style>
+    body { margin:0; font-family: system-ui; background:#fff; }
+    .wrap { height:100vh; display:flex; flex-direction:column; }
+
+    .topbar {
+      height: 48px;
+      display:flex; align-items:center; justify-content:space-between;
+      padding: 0 12px;
+      border-bottom: 1px solid #eee;
+      background:#fff;
+      flex: 0 0 auto;
+    }
+    .title { font-weight: 650; font-size: 14px; color:#111; display:flex; gap:10px; align-items:center; }
+    .dot { width:10px; height:10px; border-radius:999px; background:#35d07f; display:inline-block; }
+
+    /* === BANNIÈRE VISIBLE (fix #1) === */
+    .notice {
+      flex: 0 0 auto;
+      padding: 10px 12px;
+      font-size: 12px;
+      color: #111;
+      background: #f8fafc;
+      border-bottom: 1px solid #eef2f7;
+      position: sticky;
+      top: 48px;     /* juste sous la topbar */
+      z-index: 9;
+    }
+    .notice a { color:#111; font-weight:650; text-decoration:none; }
+    .notice a:hover { text-decoration:underline; }
+
+    .infoWrap { position: relative; display:flex; align-items:center; }
+    .infoBtn {
+      width: 34px; height: 34px;
+      border-radius: 999px;
+      border: 1px solid #e5e7eb;
+      background: #fff;
+      color:#111;
+      cursor: pointer;
+      font-weight: 700;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .tooltip {
+      position: absolute;
+      right: 0;
+      top: 42px;
+      width: min(420px, calc(100vw - 24px));
+      background:#111;
+      color:#fff;
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      line-height: 1.35;
+      box-shadow: 0 16px 60px rgba(0,0,0,.22);
+      display: none;
+      white-space: normal;
+      z-index: 10;
+    }
+    .infoWrap:hover .tooltip { display:block; }
+
+    .msgs { flex:1; overflow:auto; padding:12px; background:#fff; }
+    .bubble { margin:10px 0; max-width:85%; padding:10px 12px; border-radius:14px; background:#f3f4f6; white-space:pre-wrap; }
+    .me { margin-left:auto; background:#111; color:#fff; }
+    .sys { background:#fff7ed; border:1px solid #fed7aa; color:#7c2d12; }
+
+    /* ✅ liens cliquables + lisibles */
+    .bubble a { color:#111; text-decoration: underline; }
+    .bubble.me a { color:#fff; }
+    .bubble.sys a { color:#7c2d12; }
+
+    .row { display:flex; gap:8px; padding:10px; border-top:1px solid #eee; background:#fff; flex: 0 0 auto; }
+    input { flex:1; padding:10px 12px; border:1px solid #ddd; border-radius:12px; outline:none; }
+    button#send { padding:10px 12px; border:0; border-radius:12px; background:#111; color:#fff; cursor:pointer; }
+
+    .hint { padding:8px 12px; font-size:12px; color:#666; border-top:1px dashed #eee; flex: 0 0 auto; }
+  </style>
+</head>
+
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="title">
+      <span class="dot"></span>
+      <span id="pageTitle">Assistant (phase de test)</span>
+    </div>
+
+    <div class="infoWrap">
+      <button class="infoBtn" type="button" aria-label="Informations">i</button>
+      <div class="tooltip">
+        Ce chatbot est en cours de développement et reste en phase de test. Toute utilisation en dehors de ce cadre est interdite.
+        Pour signaler un problème, merci d’écrire à <strong>charbel.dib@ensta.fr</strong>.
+        Contributeur actuel du projet : <strong>Charbel Dib (SOIA 2026)</strong>.
+      </div>
+    </div>
+  </div>
+
+  <!-- === LIGNE DEMANDÉE (visible) === -->
+  <div class="notice" id="notice">
+    Pour signaler un problème, veuillez écrire à
+    <a href="mailto:charbel.dib@ensta.fr">charbel.dib@ensta.fr</a>.
+  </div>
+
+  <div id="msgs" class="msgs"></div>
+
+  <div class="row">
+    <input id="inp" placeholder="Écrivez un message..." />
+    <button id="send">Envoyer</button>
+  </div>
+
+  <div class="hint" id="hint"></div>
+</div>
+
+<script>
+  const msgs = document.getElementById("msgs");
+  const inp  = document.getElementById("inp");
+  const send = document.getElementById("send");
+  const hint = document.getElementById("hint");
+  const pageTitle = document.getElementById("pageTitle");
+
+  const GREETING = "Bonjour ! Je suis votre assistant intelligent de l’ENSTA. Comment puis-je vous aider ?";
+
+  const params = new URLSearchParams(location.search);
+  const botId = params.get("botId") || "default";
+
+  // Titre: on force "(phase de test)"
+  const rawTitle = (params.get("title") || "Assistant").trim();
+  const title = rawTitle.toLowerCase().includes("phase de test")
+    ? rawTitle
+    : `${rawTitle} (phase de test)`;
+  pageTitle.textContent = title;
+  document.title = title;
+
+  // session persistante par bot
+  const storageKey = "chat_session_id__" + botId;
+  const sessionId  = localStorage.getItem(storageKey) || crypto.randomUUID();
+  localStorage.setItem(storageKey, sessionId);
+
+  const seen = new Set();
+  const keyOf = (m) => `${m.ts}|${m.event || "message"}|${m.role}|${m.content}`;
+
+  let lastTs = 0;
+  let es = null;
+  let pollTimer = null;
+
+  // ✅ évite d’afficher "Conversation fermée." plusieurs fois
+  let closedShown = false;
+
+  function setHint(extra){
+    hint.textContent = `${title} · botId=${botId} · ${extra}`;
+  }
+
+  /* ===========================
+     ✅ Linkify SAFE (anti-XSS)
+     - échappe tout le texte
+     - remplace uniquement les URLs par <a>
+     - conserve les retours à la ligne
+  ============================ */
+  const URL_RE = /(https?:\/\/[^\s<]+|www\.[^\s<]+)/g;
+
+  function escapeHtml(s){
+    return (s || "").replace(/[&<>"']/g, c => (
+      { "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#39;" }[c]
+    ));
+  }
+
+  function renderWithLinks(text){
+    const esc = escapeHtml(text);
+    const linked = esc.replace(URL_RE, (m) => {
+      const href = m.startsWith("http") ? m : `https://${m}`;
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${m}</a>`;
+    });
+    return linked.replace(/\n/g, "<br>");
+  }
+
+  function add(text, who="assistant"){
+    const d = document.createElement("div");
+    d.className = "bubble";
+    if (who === "user")   d.className += " me";
+    if (who === "system") d.className += " sys";
+
+    d.innerHTML = renderWithLinks(text);
+
+    msgs.appendChild(d);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function applyEvent(m, allowUser=false){
+    const k = keyOf(m);
+    if (seen.has(k)) return;
+    seen.add(k);
+
+    if (typeof m.ts === "number") lastTs = Math.max(lastTs, m.ts);
+
+    if (m.event === "closed") {
+      if (closedShown) return;       // ✅ anti-duplication
+      closedShown = true;
+      add("Conversation fermée.", "system");
+      stopSSE();
+      return;
+    }
+
+    if (!allowUser && m.role === "user") return;
+
+    if (m.role === "assistant") add(m.content, "assistant");
+    else if (m.role === "system") add(m.content, "system");
+    else if (m.role === "user") add(m.content, "user");
+  }
+
+  function stopSSE(){
+    if (es) { try { es.close(); } catch {} es = null; }
+  }
+
+  async function loadHistory(){
+    setHint("chargement…");
+    const r = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}&limit=200`, { cache: "no-store" });
+    if (!r.ok) { setHint("erreur historique"); return; }
+
+    const items = await r.json();
+    msgs.innerHTML = "";
+    seen.clear();
+    lastTs = 0;
+    closedShown = false; // ✅ reset quand on recharge l’historique
+
+    for (const m of items) applyEvent(m, true);
+
+    if (!items.length) add(GREETING, "assistant");
+
+    setHint("prêt");
+  }
+
+  async function pollOnce(){
+    const url = `/api/poll?session_id=${encodeURIComponent(sessionId)}&after_ts=${encodeURIComponent(lastTs)}&limit=50`;
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) return;
+    const items = await r.json();
+    for (const m of items) applyEvent(m, false);
+  }
+
+  function startHybridPolling(){
+    if (pollTimer) return;
+    pollTimer = setInterval(pollOnce, 1500);
+  }
+
+  function startSSE(){
+    stopSSE();
+    es = new EventSource(`/api/events?session_id=${encodeURIComponent(sessionId)}`);
+
+    es.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        applyEvent(m, false);
+      } catch {}
+    };
+  }
+
+  async function sendMsg(){
+    const text = inp.value.trim();
+    if(!text) return;
+
+    // ✅ si la conversation était fermée, on autorise un "nouveau départ"
+    if (closedShown) {
+      closedShown = false;
+      startSSE(); // optionnel, mais utile si SSE avait été stoppé
+    }
+
+    inp.value = "";
+    add(text, "user");
+
+    const r = await fetch("/api/chat", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ bot_id: botId, session_id: sessionId, message: text }),
+      cache: "no-store"
+    });
+
+    if(!r.ok){
+      add(r.status === 429 ? "Trop de requêtes (rate-limit)." : "Erreur serveur.", "system");
+      return;
+    }
+
+    await r.json();
+    setTimeout(pollOnce, 300);
+    setTimeout(pollOnce, 1200);
+  }
+
+  send.onclick = sendMsg;
+  inp.addEventListener("keydown", e => { if(e.key==="Enter") sendMsg(); });
+
+  (async () => {
+    await loadHistory();
+    startHybridPolling();
+    startSSE();
+  })();
+</script>
+</body>
+</html>
