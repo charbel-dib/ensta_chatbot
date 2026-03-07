@@ -31,6 +31,8 @@ from pydantic import BaseModel, Field
 
 import smtplib
 from email.message import EmailMessage
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ============================================================
@@ -1117,4 +1119,5 @@ async def widget_js():
         content=js_path.read_text(encoding="utf-8"),
         media_type="application/javascript; charset=utf-8",
         headers={"Cache-Control": "no-cache"},
+
     )
