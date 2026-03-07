@@ -275,7 +275,9 @@ A daily task runs the web pipeline every day at **03:00**.
 
 ### 6.1 Install task
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\ENSTA_DATASET\scripts\install_daily_task.ps1
+powershell -ExecutionPolicy Bypass -File .\ENSTA_DATASET\scripts\install_daily_task.ps1 `
+  -ProjectRoot "C:\path\to\repo\ENSTA_DATASET" `
+  -PythonExe "C:\path\to\repo\.venv\Scripts\python.exe"
 ```
 
 Task name:
