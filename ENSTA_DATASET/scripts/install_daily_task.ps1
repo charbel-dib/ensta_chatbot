@@ -1,13 +1,12 @@
 # install_daily_task.ps1
 
-# 1) ENSTA_DATASET root (celui qui contient 01_raw/02_clean/03_chunks/04_index/scripts)
-$ProjectRoot = "C:\Users\charb\OneDrive - ENSTA\Documents\Projet 3A\to github\ENSTA_DATASET"
+param(
+    [Parameter(Mandatory=$true)][string]$ProjectRoot,
+    [Parameter(Mandatory=$true)][string]$PythonExe
+)
 
-# 2) python.exe de TON venv (celui que tu utilises pour lancer uvicorn / scripts)
-$PythonExe   = "C:\Users\charb\Downloads\Final Exam\.venv\Scripts\python.exe"
-
-$ScriptPath  = Join-Path $ProjectRoot "scripts\run_web_daily_update.py"
-$TaskName    = "ACAENSTA_WebDailyUpdate"
+$ScriptPath = Join-Path $ProjectRoot "scripts\run_web_daily_update.py"
+$TaskName = "ACAENSTA_WebDailyUpdate"
 
 # Si la tâche existe déjà -> on la remplace
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -23,4 +22,5 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
 
 Write-Host "✅ Task created: $TaskName"
 Write-Host "   Python: $PythonExe"
+
 Write-Host "   Script: $ScriptPath"
